@@ -10,7 +10,7 @@ A containerized tool that automatically downloads, extracts, and scans packages 
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
+git clone https://github.com/lukesudom/revelio-scan.git
 cd revelio-scan
 
 # Build the Docker image
