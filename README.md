@@ -1,4 +1,4 @@
-# REVELIO - Package Secret Scanner
+# REVELIO
 
 A containerized tool that automatically downloads, extracts, and scans packages from **PyPI**, **npm**, and **crates.io** for embedded secrets, API keys, tokens, and other sensitive information using TruffleHog.
 
