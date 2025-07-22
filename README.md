@@ -2,6 +2,8 @@
 
 A containerized tool that automatically downloads, extracts, and scans packages from **PyPI**, **npm**, and **crates.io** for embedded secrets, API keys, tokens, and other sensitive information using TruffleHog.
 
+![Revelio Demo](Revelio_gif.gif)
+
 ## Features
 
 - **Multi-Ecosystem Support**: PyPI, npm, and crates.io  
