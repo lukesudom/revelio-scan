@@ -128,6 +128,8 @@ class PackageScanner:
                     self.scan_npm_package(package_name, version, all_versions, only_verified, no_verification)
                 elif ecosystem == 'crates':
                     self.scan_crates_package(package_name, version, all_versions, only_verified, no_verification)
+                elif ecosystem == 'maven':
+                    self.scan_maven_package(package_name, version, all_versions, only_verified, no_verification)
                 
                 # Rate limiting between requests
                 if i < len(package_names):
@@ -138,6 +140,251 @@ class PackageScanner:
             print(f"[ERROR] File not found: {file_path}")
         except Exception as e:
             print(f"[ERROR] Error reading file {file_path}: {e}")
+
+    def scan_maven_package(self, package_name, version=None, all_versions=False, only_verified=False,
+                          no_verification=False):
+        """Scan a Maven package from Maven Central"""
+        print(f"[INFO] Scanning Maven package: {package_name}")
+        
+        # Parse group_id:artifact_id format
+        if ':' not in package_name:
+            print("[ERROR] Maven package name must be in format 'group_id:artifact_id'")
+            return
+        
+        group_id, artifact_id = package_name.split(':', 1)
+        print(f"[INFO] Group ID: {group_id}, Artifact ID: {artifact_id}")
+        
+        if all_versions:
+            # Get all versions using Maven Central Search API
+            versions = self._get_all_maven_versions(group_id, artifact_id)
+            if not versions:
+                print("[ERROR] No versions found")
+                return
+            print(f"[INFO] Found {len(versions)} versions")
+        elif version:
+            versions = [version]
+        else:
+            # Get latest version
+            latest_version = self._get_latest_maven_version(group_id, artifact_id)
+            if not latest_version:
+                print("[ERROR] Could not determine latest version")
+                return
+            versions = [latest_version]
+        
+        for ver in versions:
+            print(f"[INFO] Scanning version {ver}")
+            
+            package_info = {
+                'name': package_name,
+                'version': ver,
+                'ecosystem': 'Maven Central'
+            }
+            
+            # Try to download different artifact types (JAR, sources, etc.)
+            self._scan_maven_artifacts(group_id, artifact_id, ver, package_info, 
+                                     only_verified, no_verification)
+
+    def _get_all_maven_versions(self, group_id, artifact_id):
+        """Get all versions for a Maven artifact"""
+        try:
+            # Use Maven Central Search API to get all versions
+            search_url = "https://search.maven.org/solrsearch/select"
+            params = {
+                'q': f'g:"{group_id}" AND a:"{artifact_id}"',
+                'rows': 1000,  # Should be enough for most artifacts
+                'wt': 'json',
+                'fl': 'v,timestamp',
+                'sort': 'timestamp desc'  # Newest first
+            }
+            
+            response = self.session.get(search_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            versions = []
+            for doc in data['response']['docs']:
+                version = doc.get('v', '')
+                if version:
+                    versions.append(version)
+            
+            return versions
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to get Maven versions: {e}")
+            return []
+
+    def _get_latest_maven_version(self, group_id, artifact_id):
+        """Get the latest version for a Maven artifact"""
+        try:
+            search_url = "https://search.maven.org/solrsearch/select"
+            params = {
+                'q': f'g:"{group_id}" AND a:"{artifact_id}"',
+                'rows': 1,
+                'wt': 'json',
+                'fl': 'latestVersion'
+            }
+            
+            response = self.session.get(search_url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            docs = data['response']['docs']
+            if docs:
+                return docs[0].get('latestVersion', '')
+            
+            return None
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to get latest Maven version: {e}")
+            return None
+
+    def _scan_maven_artifacts(self, group_id, artifact_id, version, package_info, 
+                             only_verified=False, no_verification=False):
+        """Download and scan different Maven artifact types"""
+        # Convert group_id to path format
+        group_path = group_id.replace('.', '/')
+        base_url = f"https://repo1.maven.org/maven2/{group_path}/{artifact_id}/{version}"
+        
+        # Artifact types to try (in order of preference for secret scanning)
+        artifact_types = [
+            ('sources.jar', 'Source JAR'),  # Most likely to contain secrets
+            ('jar', 'Main JAR'),            # Compiled code but may have resources
+            ('pom', 'POM file'),            # May contain credentials/URLs
+        ]
+        
+        scanned_any = False
+        
+        for artifact_type, description in artifact_types:
+            if artifact_type == 'sources.jar':
+                filename = f"{artifact_id}-{version}-sources.jar"
+            elif artifact_type == 'pom':
+                filename = f"{artifact_id}-{version}.pom"
+            else:
+                filename = f"{artifact_id}-{version}.jar"
+            
+            download_url = f"{base_url}/{filename}"
+            
+            print(f"[INFO] Trying to download {description}: {filename}")
+            
+            # Check if artifact exists
+            try:
+                head_response = self.session.head(download_url)
+                if head_response.status_code != 200:
+                    print(f"[WARN] {description} not available (HTTP {head_response.status_code})")
+                    continue
+            except Exception as e:
+                print(f"[WARN] Error checking {description}: {e}")
+                continue
+            
+            # Download and scan this artifact
+            package_identifier = f"{group_id.replace('.', '-')}-{artifact_id}-{version}-{artifact_type.replace('.', '-')}"
+            
+            try:
+                self._download_and_scan_maven_artifact(
+                    download_url, package_identifier, description, 
+                    only_verified, no_verification, package_info, artifact_type
+                )
+                scanned_any = True
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to scan {description}: {e}")
+                continue
+        
+        if not scanned_any:
+            print(f"[ERROR] No artifacts could be downloaded for {group_id}:{artifact_id}:{version}")
+
+    def _download_and_scan_maven_artifact(self, url, package_identifier, description, 
+                                         only_verified=False, no_verification=False, 
+                                         package_info=None, artifact_type=None):
+        """Download and scan a specific Maven artifact"""
+        work_dir = None
+        try:
+            # Create temporary working directory
+            work_dir = tempfile.mkdtemp(dir=self.temp_dir, prefix=f"maven_scan_{package_identifier}_")
+            work_path = Path(work_dir)
+
+            print(f"[INFO] Downloading {description} from {url}")
+
+            # Download the artifact
+            response = self.session.get(url, stream=True)
+            response.raise_for_status()
+
+            # Determine filename and handling
+            if artifact_type == 'pom':
+                filename = f"{package_identifier}.pom"
+                extract_path = work_path / "extracted"
+                extract_path.mkdir()
+                
+                # POM files are XML, save directly
+                pom_path = extract_path / "pom.xml"
+                with open(pom_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+            else:
+                # JAR files (including sources.jar)
+                filename = f"{package_identifier}.jar"
+                archive_path = work_path / filename
+
+                # Save the downloaded file
+                with open(archive_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                print(f"[INFO] Extracting {description}")
+
+                # Extract the JAR file (JARs are ZIP files)
+                extract_path = work_path / "extracted"
+                extract_path.mkdir()
+
+                try:
+                    with zipfile.ZipFile(archive_path, 'r') as jar:
+                        jar.extractall(extract_path)
+                except zipfile.BadZipFile:
+                    print(f"[WARN] {description} is not a valid ZIP/JAR file")
+                    return
+
+            print(f"[INFO] Running TruffleHog scan on {description}")
+
+            # Build TruffleHog command
+            trufflehog_cmd = [
+                'trufflehog',
+                'filesystem',
+                str(extract_path),
+                '--no-update',
+                '--json'
+            ]
+
+            # Add verification flags
+            if only_verified:
+                trufflehog_cmd.append('--only-verified')
+            elif no_verification:
+                trufflehog_cmd.append('--no-verification')
+
+            # Run TruffleHog
+            result = subprocess.run(trufflehog_cmd, capture_output=True, text=True)
+
+            if result.stdout:
+                print(f"[RESULTS] TruffleHog Results for {description}:")
+                print(result.stdout)
+                
+                # Send Discord alert if verified secrets found
+                if package_info:
+                    self.discord_logger.send_alert(package_info, result.stdout)
+            else:
+                print(f"[RESULTS] No secrets found in {description}")
+
+            if result.stderr:
+                print(f"[WARN] TruffleHog stderr for {description}:")
+                print(result.stderr)
+
+        except Exception as e:
+            print(f"[ERROR] Error scanning {description} for {package_identifier}: {e}")
+        finally:
+            # Cleanup
+            if work_dir and os.path.exists(work_dir):
+                print(f"[INFO] Cleaning up {work_dir}")
+                shutil.rmtree(work_dir)
 
     def scan_crates_package(self, package_name, version=None, all_versions=False, only_verified=False,
                            no_verification=False):
@@ -398,14 +645,17 @@ Examples:
   python scan.py --npm @babel/core
   python scan.py --pypi requests
   python scan.py --crates serde
+  python scan.py --maven com.google.guava:guava
 
   # Scan specific version
   python scan.py --pypi requests --version 2.28.1
+  python scan.py --maven org.apache.commons:commons-lang3 --version 3.12.0
 
   # Scan from file (works with all ecosystems)
   python scan.py --crates --file crate_names.txt
   python scan.py --pypi --file python_packages.txt
   python scan.py --npm --file npm_packages.txt
+  python scan.py --maven --file maven_packages.txt
 
   # Scan with Discord alerts
   python scan.py --npm lodash --discord-webhook https://discord.com/api/webhooks/...
@@ -417,6 +667,7 @@ Package Ecosystems:
   --pypi      Scan Python packages from PyPI
   --npm       Scan JavaScript packages from npm (supports scoped packages)
   --crates    Scan Rust crates from crates.io
+  --maven     Scan Java packages from Maven Central (format: group_id:artifact_id)
 
 Input Options:
   package_name        Single package name to scan
@@ -443,6 +694,7 @@ Discord Integration:
     ecosystem_group.add_argument('--pypi', action='store_true', help='Scan PyPI package')
     ecosystem_group.add_argument('--npm', action='store_true', help='Scan npm package')
     ecosystem_group.add_argument('--crates', action='store_true', help='Scan Rust crates')
+    ecosystem_group.add_argument('--maven', action='store_true', help='Scan Maven package (format: group_id:artifact_id)')
 
     # Input options
     input_group = parser.add_mutually_exclusive_group(required=True)
@@ -485,7 +737,7 @@ Discord Integration:
         sys.exit(1)
 
     # Determine ecosystem
-    ecosystem = 'pypi' if args.pypi else 'npm' if args.npm else 'crates'
+    ecosystem = 'pypi' if args.pypi else 'npm' if args.npm else 'crates' if args.crates else 'maven'
 
     # Show configuration
     if args.file:
@@ -521,6 +773,9 @@ Discord Integration:
             elif args.crates:
                 scanner.scan_crates_package(args.package_name, args.version, args.all_versions,
                                           args.only_verified, args.no_verification)
+            elif args.maven:
+                scanner.scan_maven_package(args.package_name, args.version, args.all_versions,
+                                         args.only_verified, args.no_verification)
     except KeyboardInterrupt:
         print("\n[WARN] Scan interrupted by user")
         sys.exit(1)
